@@ -39,4 +39,4 @@ Content-aware fit is enabled by default for transparent PNGs. UI Studio finds th
 
 The application uses a Photoshop-like neutral-grey theme with an orange accent and fully custom-styled controls rather than native system widgets. The application shell itself never scrolls. Scrolling is isolated to the folder tree, asset grid, queue, and settings inspector, each with a custom dark scrollbar and contained overscroll behavior. The folder and settings panels have draggable splitters and persist their widths. The thick bottom status surface shows a full-width animated progress indicator while scans or model batches are running, then resolves to success or failure.
 
-The next milestone is production hardening: cancellation/progress events, text-bearing asset detection and warnings, retry seeds/variation controls, and broader evaluation on representative Unity folders.
+The next milestone is production hardening: download cancellation, text-bearing asset detection and warnings, retry seeds/variation controls, and broader evaluation on representative Unity folders.

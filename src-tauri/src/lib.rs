@@ -1,14 +1,20 @@
 use image::{GenericImageView, ImageReader};
+use reqwest::{
+    header::{CONTENT_RANGE, RANGE},
+    StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tauri::{AppHandle, Emitter};
 use walkdir::WalkDir;
 
 #[derive(Deserialize)]
@@ -65,6 +71,18 @@ struct DownloadResult {
     resource_id: String,
     files: usize,
     bytes: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    resource_id: String,
+    file_name: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    resumed_bytes: u64,
+    attempt: u8,
+    phase: String,
 }
 
 #[derive(Serialize)]
@@ -547,6 +565,8 @@ fn resource_install_root(studio_root: &Path) -> PathBuf {
 }
 
 fn download_one(
+    app: &AppHandle,
+    resource_id: &str,
     client: &reqwest::blocking::Client,
     url: &str,
     destination: &Path,
@@ -564,42 +584,192 @@ fn download_one(
         .ok_or_else(|| "Resource destination has no parent".to_string())?;
     fs::create_dir_all(parent).map_err(|error| format!("Cannot create resource folder: {error}"))?;
     let part = PathBuf::from(format!("{}.part", destination.to_string_lossy()));
-    let mut response = client
-        .get(url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|error| format!("Download failed for {url}: {error}"))?;
-    let mut output = fs::File::create(&part)
-        .map_err(|error| format!("Cannot create temporary download {}: {error}", part.display()))?;
-    let mut digest = Sha256::new();
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 1024 * 256];
-    loop {
-        let count = response
-            .read(&mut buffer)
-            .map_err(|error| format!("Download interrupted for {url}: {error}"))?;
-        if count == 0 {
-            break;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("resource")
+        .to_string();
+    let maximum_attempts = 5u8;
+    let mut initially_resumed = 0u64;
+
+    for attempt in 1..=maximum_attempts {
+        let mut offset = fs::metadata(&part).map(|metadata| metadata.len()).unwrap_or(0);
+        if expected_bytes.is_none() && offset > 0 {
+            fs::remove_file(&part)
+                .map_err(|error| format!("Cannot restart {}: {error}", part.display()))?;
+            offset = 0;
         }
-        output
-            .write_all(&buffer[..count])
-            .map_err(|error| format!("Cannot write {}: {error}", part.display()))?;
-        digest.update(&buffer[..count]);
-        downloaded += count as u64;
-    }
-    output
-        .sync_all()
-        .map_err(|error| format!("Cannot finalize {}: {error}", part.display()))?;
-    if let Some(expected) = expected_bytes {
-        if downloaded != expected {
-            return Err(format!("Size check failed for {url}: expected {expected}, received {downloaded}"));
+        if expected_bytes.is_some_and(|expected| offset > expected) {
+            fs::remove_file(&part)
+                .map_err(|error| format!("Cannot discard oversized partial file {}: {error}", part.display()))?;
+            offset = 0;
         }
-    }
-    if let Some(expected) = expected_sha256 {
-        let actual = format!("{:x}", digest.finalize());
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(format!("SHA-256 check failed for {url}"));
+        if initially_resumed == 0 && offset > 0 {
+            initially_resumed = offset;
         }
+
+        let _ = app.emit(
+            "resource-download-progress",
+            DownloadProgress {
+                resource_id: resource_id.to_string(),
+                file_name: file_name.clone(),
+                downloaded_bytes: offset,
+                total_bytes: expected_bytes,
+                resumed_bytes: initially_resumed,
+                attempt,
+                phase: if offset > 0 { "resuming" } else { "downloading" }.to_string(),
+            },
+        );
+
+        let complete_by_size = expected_bytes.is_some_and(|expected| offset == expected);
+        if !complete_by_size {
+            let mut request = client.get(url);
+            if offset > 0 {
+                request = request.header(RANGE, format!("bytes={offset}-"));
+            }
+            let mut response = match request.send() {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt == maximum_attempts {
+                        return Err(format!("Download failed for {url} after {maximum_attempts} attempts: {error}"));
+                    }
+                    let _ = app.emit(
+                        "resource-download-progress",
+                        DownloadProgress {
+                            resource_id: resource_id.to_string(), file_name: file_name.clone(),
+                            downloaded_bytes: offset, total_bytes: expected_bytes,
+                            resumed_bytes: initially_resumed, attempt,
+                            phase: "retrying".to_string(),
+                        },
+                    );
+                    thread::sleep(Duration::from_secs(1u64 << (attempt - 1)));
+                    continue;
+                }
+            };
+            let status = response.status();
+            if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+                let content_range = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| format!("Resume response for {url} omitted Content-Range"))?;
+                validate_content_range(content_range, offset, expected_bytes)?;
+            } else if status.is_success() {
+                // A server may ignore Range and return 200. Restart this file safely
+                // rather than appending a complete response to the partial bytes.
+                offset = 0;
+                initially_resumed = 0;
+            } else if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                if attempt == maximum_attempts {
+                    return Err(format!("Download failed for {url}: HTTP {status}"));
+                }
+                let _ = app.emit(
+                    "resource-download-progress",
+                    DownloadProgress {
+                        resource_id: resource_id.to_string(), file_name: file_name.clone(),
+                        downloaded_bytes: offset, total_bytes: expected_bytes,
+                        resumed_bytes: initially_resumed, attempt,
+                        phase: "retrying".to_string(),
+                    },
+                );
+                thread::sleep(Duration::from_secs(1u64 << (attempt - 1)));
+                continue;
+            } else {
+                return Err(format!("Download failed for {url}: HTTP {status}"));
+            }
+
+            let mut output = if offset > 0 {
+                OpenOptions::new().append(true).open(&part)
+            } else {
+                fs::File::create(&part)
+            }
+            .map_err(|error| format!("Cannot open temporary download {}: {error}", part.display()))?;
+            let mut downloaded = offset;
+            let mut buffer = [0u8; 1024 * 256];
+            let mut last_emit = Instant::now();
+            let transfer = loop {
+                let count = match response.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(error) => break Err(error.to_string()),
+                };
+                if count == 0 {
+                    break Ok(());
+                }
+                if let Err(error) = output.write_all(&buffer[..count]) {
+                    return Err(format!("Cannot write {}: {error}", part.display()));
+                }
+                downloaded += count as u64;
+                if last_emit.elapsed() >= Duration::from_millis(250) {
+                    let _ = app.emit(
+                        "resource-download-progress",
+                        DownloadProgress {
+                            resource_id: resource_id.to_string(), file_name: file_name.clone(),
+                            downloaded_bytes: downloaded, total_bytes: expected_bytes,
+                            resumed_bytes: initially_resumed, attempt,
+                            phase: if initially_resumed > 0 { "resuming" } else { "downloading" }.to_string(),
+                        },
+                    );
+                    last_emit = Instant::now();
+                }
+            };
+            output
+                .sync_all()
+                .map_err(|error| format!("Cannot finalize {}: {error}", part.display()))?;
+            drop(output);
+            if let Err(error) = transfer {
+                if attempt == maximum_attempts {
+                    return Err(format!("Download interrupted for {url} after {maximum_attempts} attempts: {error}"));
+                }
+                let kept = fs::metadata(&part).map(|metadata| metadata.len()).unwrap_or(downloaded);
+                let _ = app.emit(
+                    "resource-download-progress",
+                    DownloadProgress {
+                        resource_id: resource_id.to_string(), file_name: file_name.clone(),
+                        downloaded_bytes: kept, total_bytes: expected_bytes,
+                        resumed_bytes: initially_resumed, attempt,
+                        phase: "retrying".to_string(),
+                    },
+                );
+                thread::sleep(Duration::from_secs(1u64 << (attempt - 1)));
+                continue;
+            }
+        }
+
+        let actual_bytes = fs::metadata(&part)
+            .map_err(|error| format!("Cannot inspect {}: {error}", part.display()))?
+            .len();
+        if expected_bytes.is_some_and(|expected| actual_bytes < expected) {
+            if attempt == maximum_attempts {
+                return Err(format!("Download ended early for {url}: kept {actual_bytes} bytes for the next resume"));
+            }
+            thread::sleep(Duration::from_secs(1u64 << (attempt - 1)));
+            continue;
+        }
+        if expected_bytes.is_some_and(|expected| actual_bytes != expected) {
+            let _ = fs::remove_file(&part);
+            return Err(format!("Size check failed for {url}; the invalid partial file was discarded"));
+        }
+        let _ = app.emit(
+            "resource-download-progress",
+            DownloadProgress {
+                resource_id: resource_id.to_string(), file_name: file_name.clone(),
+                downloaded_bytes: actual_bytes, total_bytes: expected_bytes,
+                resumed_bytes: initially_resumed, attempt,
+                phase: "verifying".to_string(),
+            },
+        );
+        if let Some(expected_sha256) = expected_sha256 {
+            let expected_size = expected_bytes.unwrap_or(actual_bytes);
+            if let Err(error) = verified_file(&part, expected_size, expected_sha256) {
+                let _ = fs::remove_file(&part);
+                if attempt < maximum_attempts {
+                    initially_resumed = 0;
+                    continue;
+                }
+                return Err(format!("{error}; the invalid partial file was discarded"));
+            }
+        }
+        break;
     }
     if destination.exists() {
         fs::remove_file(destination)
@@ -607,7 +777,39 @@ fn download_one(
     }
     fs::rename(&part, destination)
         .map_err(|error| format!("Cannot install {}: {error}", destination.display()))?;
+    let downloaded = fs::metadata(destination)
+        .map_err(|error| format!("Cannot inspect installed resource {}: {error}", destination.display()))?
+        .len();
+    let _ = app.emit(
+        "resource-download-progress",
+        DownloadProgress {
+            resource_id: resource_id.to_string(), file_name,
+            downloaded_bytes: downloaded, total_bytes: expected_bytes,
+            resumed_bytes: initially_resumed, attempt: 1,
+            phase: "complete".to_string(),
+        },
+    );
     Ok(downloaded)
+}
+
+fn validate_content_range(value: &str, expected_start: u64, expected_total: Option<u64>) -> Result<(), String> {
+    let value = value.trim();
+    let range = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| format!("Invalid Content-Range: {value}"))?;
+    let (bounds, total) = range
+        .split_once('/')
+        .ok_or_else(|| format!("Invalid Content-Range: {value}"))?;
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or_else(|| format!("Invalid Content-Range: {value}"))?;
+    let start = start.parse::<u64>().map_err(|_| format!("Invalid Content-Range: {value}"))?;
+    let end = end.parse::<u64>().map_err(|_| format!("Invalid Content-Range: {value}"))?;
+    let total = total.parse::<u64>().map_err(|_| format!("Invalid Content-Range: {value}"))?;
+    if start != expected_start || end < start || end >= total || expected_total.is_some_and(|expected| expected != total) {
+        return Err(format!("Unexpected Content-Range while resuming: {value}"));
+    }
+    Ok(())
 }
 
 fn verified_file(path: &Path, expected_bytes: u64, expected_sha256: &str) -> Result<(), String> {
@@ -741,7 +943,7 @@ fn install_archive(
     Ok(())
 }
 
-fn download_resource_blocking(resource_id: &str) -> Result<DownloadResult, String> {
+fn download_resource_blocking(app: &AppHandle, resource_id: &str) -> Result<DownloadResult, String> {
     if !cuda_driver_available() {
         return Err("Downloads are disabled because no CUDA-capable NVIDIA GPU with a working NVIDIA driver was detected".to_string());
     }
@@ -754,7 +956,8 @@ fn download_resource_blocking(resource_id: &str) -> Result<DownloadResult, Strin
     .map_err(|error| format!("Invalid resource manifest: {error}"))?;
     let install_root = resource_install_root(&studio_root);
     let client = reqwest::blocking::Client::builder()
-        .user_agent("UI-Studio/0.1.0")
+        .user_agent(concat!("UI-Studio/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("Cannot initialize downloader: {error}"))?;
     let mut downloaded_files = 0usize;
@@ -764,6 +967,8 @@ fn download_resource_blocking(resource_id: &str) -> Result<DownloadResult, Strin
         for download in &resource.downloads {
             let relative = safe_resource_relative(&download.destination)?;
             downloaded_bytes += download_one(
+                app,
+                resource_id,
                 &client,
                 &download.url,
                 &install_root.join(relative),
@@ -798,6 +1003,8 @@ fn download_resource_blocking(resource_id: &str) -> Result<DownloadResult, Strin
             let relative = safe_resource_relative(&format!("{base_destination}/{}", file.path))?;
             let url = format!("{base_url}{}?download=true", file.path.replace('\\', "/"));
             downloaded_bytes += download_one(
+                app,
+                resource_id,
                 &client,
                 &url,
                 &install_root.join(relative),
@@ -819,8 +1026,8 @@ fn download_resource_blocking(resource_id: &str) -> Result<DownloadResult, Strin
 }
 
 #[tauri::command]
-async fn download_resource(resource_id: String) -> Result<DownloadResult, String> {
-    tauri::async_runtime::spawn_blocking(move || download_resource_blocking(&resource_id))
+async fn download_resource(app: AppHandle, resource_id: String) -> Result<DownloadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || download_resource_blocking(&app, &resource_id))
         .await
         .map_err(|error| format!("Resource download task failed: {error}"))?
 }
@@ -1395,5 +1602,14 @@ mod tests {
         assert!(error.contains("outside the source"));
         assert!(safe_relative("../escape.png").is_err());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn validates_resume_content_ranges() {
+        assert!(validate_content_range("bytes 1024-2047/4096", 1024, Some(4096)).is_ok());
+        assert!(validate_content_range("bytes 0-99/100", 0, Some(100)).is_ok());
+        assert!(validate_content_range("bytes 0-99/100", 10, Some(100)).is_err());
+        assert!(validate_content_range("bytes 1024-2047/8192", 1024, Some(4096)).is_err());
+        assert!(validate_content_range("items 1-2/3", 1, Some(3)).is_err());
     }
 }

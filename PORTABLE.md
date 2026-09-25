@@ -17,6 +17,6 @@ UI-Studio/
   models/                  downloaded later
 ```
 
-The resource modal detects missing components, downloads every file over HTTPS, verifies declared sizes and SHA-256 hashes, and safely installs the split FLUX runtime plus model components. See `resources/FRESH-WINDOWS-READINESS.md` in the source project for the release-asset contract and clean-machine test procedure.
+The resource modal detects missing components, resumes interrupted files with HTTP byte ranges, retries temporary network failures, shows byte-level progress, verifies declared sizes and SHA-256 hashes, and safely installs the split FLUX runtime plus model components. See `resources/FRESH-WINDOWS-READINESS.md` in the source project for the release-asset contract and clean-machine test procedure.
 
 Before the resource page opens, UI Studio performs a local compatibility scan. Downloads remain disabled unless `nvidia-smi` confirms a CUDA-capable NVIDIA GPU and working display driver. A CUDA Toolkit installation is not required because the portable runtime contains the required CUDA-enabled PyTorch libraries.

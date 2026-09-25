@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { AssetInfo, InventoryReport, PaletteColor, ProcessResult, QueueStatus, Settings } from "./types";
 import logoUrl from "../logo_Ui.png";
@@ -37,7 +38,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 <div id="preview" class="preview" hidden><div class="preview-stage"><img id="preview-image" draggable="false"/></div><div class="preview-meta"><strong id="preview-name"></strong><span id="preview-info"></span></div><div class="preview-help">Wheel: zoom at cursor · Space-drag: pan · Esc/click outside: close</div></div>
 <div id="comparison" class="modal" hidden><section class="comparison-dialog"><header><div><strong id="comparison-name">Before / after</strong><span id="comparison-info"></span></div><button id="close-comparison" title="Close">×</button></header><div class="compare"><figure><div class="checker"><img id="comparison-before"/></div><figcaption>Before</figcaption></figure><figure><div class="checker"><img id="comparison-after"/></div><figcaption>After</figcaption></figure></div></section></div>
 <div id="preflight-modal" class="modal" hidden><section class="preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="preflight-title"><header><div><strong id="preflight-title">PC compatibility check</strong><span>Required before downloading FLUX resources</span></div><button id="close-preflight" title="Close" aria-label="Close">×</button></header><div id="preflight-body" class="preflight-body"><div class="preflight-scanning"><i></i><strong>Checking this PC…</strong><span>GPU, NVIDIA driver, memory, processor, and storage</span></div></div><footer><button id="rescan-system" type="button">Scan again</button><button id="continue-downloads" class="primary" type="button" disabled>Open downloads</button></footer></section></div>
-<div id="resources-modal" class="modal" hidden><section class="resources-dialog" role="dialog" aria-modal="true" aria-labelledby="resources-title"><header><div><strong id="resources-title">Model resources</strong><span>Local components required for portable AI processing</span></div><button id="close-resources" title="Close" aria-label="Close">×</button></header><div class="resources-summary"><div><b id="resources-installed">Checking…</b><span id="resources-summary-text">Reading local resource status</span></div><button id="refresh-resources" type="button">Refresh status</button></div><div id="resources-list" class="resources-list"><p>Checking installed resources…</p></div><footer><span>Downloads use HTTPS and are validated before installation.</span></footer></section></div>
+<div id="resources-modal" class="modal" hidden><section class="resources-dialog" role="dialog" aria-modal="true" aria-labelledby="resources-title"><header><div><strong id="resources-title">Model resources</strong><span>Local components required for portable AI processing</span></div><button id="close-resources" title="Close" aria-label="Close">×</button></header><div class="resources-summary"><div><b id="resources-installed">Checking…</b><span id="resources-summary-text">Reading local resource status</span><div id="download-meter" class="download-meter" hidden><i id="download-meter-fill"></i></div></div><button id="refresh-resources" type="button">Refresh status</button></div><div id="resources-list" class="resources-list"><p>Checking installed resources…</p></div><footer><span>Downloads resume automatically and are verified before installation.</span></footer></section></div>
 <div id="color-picker" class="color-picker" hidden><canvas id="color-wheel" width="190" height="190"></canvas><label>Brightness<input id="color-value" type="range" min="0" max="1" step="0.01"/></label><label>Hex<input id="color-hex" type="text" maxlength="7" spellcheck="false"/></label><button id="close-color-picker">Done</button></div>
 <div id="global-tooltip" class="global-tooltip" role="tooltip" hidden></div>`;
 
@@ -60,10 +61,12 @@ let fluxAvailable: boolean | undefined;
 type RuntimeResource = { id: string; group: string; name: string; description: string; path: string; available: boolean; optional?: boolean; downloadBytes?: number; sizeEstimated?: boolean };
 type RuntimeProbe = { available: boolean; engine: string; missing: string[]; resources: RuntimeResource[] };
 type DownloadResult = { resourceId: string; files: number; bytes: number };
+type DownloadProgress = { resourceId: string; fileName: string; downloadedBytes: number; totalBytes?: number; resumedBytes: number; attempt: number; phase: "downloading" | "resuming" | "retrying" | "verifying" | "complete" };
 type GpuInfo = { name: string; memoryMib: number; driverVersion: string };
 type SystemScan = { compatible: boolean; nvidiaDetected: boolean; cudaAvailable: boolean; cudaVersion?: string; gpus: GpuInfo[]; cpuName: string; logicalCores: number; memoryBytes?: number; freeDiskBytes?: number; osName: string; warning?: string };
 let runtimeResources: RuntimeResource[] = [];
 let resourceDownloadActive = false;
+let activeDownloadPosition = "";
 let systemScanActive = false, downloadHardwareApproved = false;
 let runtimeBlockingMessage = "";
 let paletteEditingIndex: number | null = null, pickerHue = 0, pickerSaturation = 0, pickerValue = 1;
@@ -75,6 +78,17 @@ function styleFingerprint(): string { const profile = JSON.stringify({ model: "F
 function renderStyleFingerprint(): void { $("#style-fingerprint").textContent = `${styleFingerprint()} · ${settings.styleLockEnabled ? "locked" : "unlocked"}`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!)); }
 function formatBytes(bytes: number): string { if (!Number.isFinite(bytes) || bytes < 0) return "Size unknown"; const units = ["B", "KB", "MB", "GB", "TB"]; let value = bytes, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; } return `${value.toFixed(unit === 0 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`; }
+await listen<DownloadProgress>("resource-download-progress", event => {
+  if (!resourceDownloadActive) return;
+  const progress = event.payload, meter = $("#download-meter"), fill = $("#download-meter-fill");
+  meter.hidden = false;
+  const percent = progress.totalBytes && progress.totalBytes > 0 ? Math.min(100, progress.downloadedBytes / progress.totalBytes * 100) : 0;
+  meter.classList.toggle("indeterminate", !progress.totalBytes);
+  fill.style.width = `${percent}%`;
+  const amount = progress.totalBytes ? `${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${percent.toFixed(1)}%` : formatBytes(progress.downloadedBytes);
+  const action = progress.phase === "retrying" ? `Connection interrupted · retrying ${progress.attempt + 1}/5` : progress.phase === "verifying" ? "Verifying download" : progress.phase === "complete" ? "Download complete" : progress.resumedBytes > 0 ? `Resuming from ${formatBytes(progress.resumedBytes)}` : "Downloading";
+  $("#resources-summary-text").textContent = `${action} · ${progress.fileName} · ${amount}${activeDownloadPosition}`;
+});
 function setStatus(value: string, progress: "idle" | "running" | "complete" | "failed" = "idle"): void { $("#status-text").textContent = runtimeBlockingMessage || value; $("#status-progress").className = `status-progress ${runtimeBlockingMessage ? "failed" : progress}`; }
 function showTooltip(anchor: HTMLElement): void { const tooltip = $("#global-tooltip"); tooltip.textContent = anchor.dataset.tooltip ?? ""; tooltip.hidden = false; const rect = anchor.getBoundingClientRect(), tip = tooltip.getBoundingClientRect(), margin = 10; let left = rect.right - tip.width, top = rect.top - tip.height - 8; left = Math.max(margin, Math.min(window.innerWidth - tip.width - margin, left)); if (top < margin) top = Math.min(window.innerHeight - tip.height - margin, rect.bottom + 8); tooltip.style.left = `${Math.round(left)}px`; tooltip.style.top = `${Math.round(top)}px`; }
 function hideTooltip(): void { $("#global-tooltip").hidden = true; }
@@ -209,7 +223,26 @@ function renderResources(): void {
   $("#resources-list").querySelectorAll<HTMLButtonElement>(".download-group:not(:disabled)").forEach(button => { button.onclick = () => downloadResources(runtimeResources.filter(resource => resource.group === button.dataset.resourceGroup && !resource.available).map(resource => resource.id)); });
   $("#resources-list").querySelectorAll<HTMLButtonElement>(".download-resource:not(:disabled)").forEach(button => { button.onclick = () => downloadResources([button.dataset.resourceId!]); });
 }
-async function downloadResources(ids: string[]): Promise<void> { if (!downloadHardwareApproved) { $("#resources-modal").hidden = true; await scanHardware(); return; } if (resourceDownloadActive || !ids.length) return; resourceDownloadActive = true; renderResources(); let failure = ""; try { for (let index = 0; index < ids.length; index++) { const resource = runtimeResources.find(item => item.id === ids[index]); $("#resources-summary-text").textContent = `Downloading ${resource?.name ?? ids[index]} · ${index + 1}/${ids.length}`; const result = await invoke<DownloadResult>("download_resource", { resourceId: ids[index] }); $("#resources-summary-text").textContent = `Installed ${resource?.name ?? result.resourceId} · ${formatBytes(result.bytes)}`; } } catch (error) { failure = String(error); } finally { resourceDownloadActive = false; await refreshResources(); if (failure) $("#resources-summary-text").textContent = `Download failed: ${failure}`; } }
+async function downloadResources(ids: string[]): Promise<void> {
+  if (!downloadHardwareApproved) { $("#resources-modal").hidden = true; await scanHardware(); return; }
+  if (resourceDownloadActive || !ids.length) return;
+  resourceDownloadActive = true; $("#download-meter").hidden = false; $("#download-meter-fill").style.width = "0%"; renderResources();
+  let failure = "";
+  try {
+    for (let index = 0; index < ids.length; index++) {
+      const resource = runtimeResources.find(item => item.id === ids[index]);
+      activeDownloadPosition = ` · resource ${index + 1}/${ids.length}`;
+      $("#resources-summary-text").textContent = `Preparing ${resource?.name ?? ids[index]}${activeDownloadPosition}`;
+      const result = await invoke<DownloadResult>("download_resource", { resourceId: ids[index] });
+      $("#resources-summary-text").textContent = `Installed ${resource?.name ?? result.resourceId} · ${formatBytes(result.bytes)}`;
+    }
+  } catch (error) { failure = String(error); }
+  finally {
+    resourceDownloadActive = false; activeDownloadPosition = ""; await refreshResources();
+    $("#download-meter").hidden = true; $("#download-meter").classList.remove("indeterminate");
+    if (failure) $("#resources-summary-text").textContent = `Download paused: ${failure}. Click Download again to resume.`;
+  }
+}
 async function refreshResources(): Promise<void> { const refresh = $<HTMLButtonElement>("#refresh-resources"); refresh.disabled = true; refresh.textContent = "Checking…"; try { const model = await invoke<RuntimeProbe>("probe_flux"); runtimeResources = model.resources ?? []; fluxAvailable = model.available; renderResources(); updateRuntimeState(); } catch { runtimeResources = []; fluxAvailable = false; renderResources(); updateRuntimeState(); } finally { refresh.disabled = false; refresh.textContent = "Refresh status"; } }
 function setupResizer(selector: string, side: "left" | "right"): void { const handle = $(selector), workspace = $("#workspace"); handle.onpointerdown = event => { handle.setPointerCapture(event.pointerId); document.body.classList.add("resizing-panels"); }; handle.onpointermove = event => { if (!handle.hasPointerCapture(event.pointerId)) return; const rect = workspace.getBoundingClientRect(), value = side === "left" ? event.clientX - rect.left : rect.right - event.clientX, clamped = Math.round(Math.max(side === "left" ? 180 : 300, Math.min(side === "left" ? 460 : 620, value))); if (side === "left") settings.leftPanelWidth = clamped; else settings.rightPanelWidth = clamped; workspace.style.setProperty(side === "left" ? "--left-width" : "--right-width", `${clamped}px`); }; handle.onpointerup = event => { if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId); document.body.classList.remove("resizing-panels"); persist(); }; }
 

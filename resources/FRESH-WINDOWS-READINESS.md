@@ -29,6 +29,8 @@ The public GitHub repository serves the split runtime and LoRA as release assets
 - Download individual resources or all missing resources in a group.
 - Show exact individual and group download sizes.
 - Write downloads to temporary `.part` paths.
+- Resume interrupted `.part` downloads with validated HTTP byte ranges and automatic retry backoff.
+- Show live downloaded/total bytes and whether a transfer resumed.
 - Verify declared byte sizes and SHA-256 hashes before installation.
 - Reassemble and verify the split runtime archive.
 - Inspect archive paths, extract to staging, verify required runtime files, and replace the runtime only after validation.
@@ -38,8 +40,7 @@ The public GitHub repository serves the split runtime and LoRA as release assets
 
 ## Current limitations
 
-- Interrupted transfers restart rather than resume with HTTP range requests.
-- The modal reports the current resource but does not yet expose byte-level progress or cancellation.
+- Active transfers do not yet have a manual pause or cancellation button. Closing the app preserves completed partial bytes for the next attempt.
 - WebView2 installation remains a Windows prerequisite; current Windows 11 systems normally include it.
 
 ## Clean-machine release test

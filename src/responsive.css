@@ -1036,6 +1036,38 @@ button:hover {
   font-size: 13px;
 }
 
+.download-meter {
+  position: relative;
+  width: min(430px, 58vw);
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #171717;
+  box-shadow: inset 0 0 0 1px #3d3d3d;
+}
+
+.download-meter[hidden] { display: none; }
+
+.download-meter > i {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: #f28c28;
+  transition: width .2s linear;
+}
+
+.download-meter.indeterminate > i {
+  width: 34% !important;
+  animation: resource-download-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes resource-download-indeterminate {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(310%); }
+}
+
 .resources-summary button {
   flex: none;
   color: #f2f2f2;
