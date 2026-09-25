@@ -1,0 +1,23 @@
+[package]
+name = "ui-studio"
+version = "0.1.0"
+description = "Safe batch UI asset reskinning workspace"
+authors = ["UI Studio"]
+edition = "2021"
+
+[lib]
+name = "ui_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["blocking"] }
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+walkdir = "2"

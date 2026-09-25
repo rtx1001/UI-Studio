@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "applicationVersion": "0.1.0",
+  "generatedAt": "2026-09-24",
+  "resources": [
+    {
+      "id": "flux-runtime",
+      "group": "FLUX.2 Klein 4B",
+      "name": "FLUX application runtime",
+      "license": "Apache-2.0",
+      "source": "https://github.com/modelscope/DiffSynth-Studio",
+      "downloads": [
+        {
+          "url": "https://github.com/rtx1001/UI-Studio/releases/download/resources-v0.1.0/UI-Studio-FLUX-Runtime-windows-x64.zip.part01",
+          "bytes": 1992294400,
+          "sha256": "9b4f42d99874e3064de015780c5ad0b377d7760be0099305666730b1c5a5edc4",
+          "destination": "resources/downloads/UI-Studio-FLUX-Runtime-windows-x64.zip.part01"
+        },
+        {
+          "url": "https://github.com/rtx1001/UI-Studio/releases/download/resources-v0.1.0/UI-Studio-FLUX-Runtime-windows-x64.zip.part02",
+          "bytes": 1012302219,
+          "sha256": "3400a6614ab01ce7ccf7b7f52db03896189d04f697e4f33efbbf864334c4b07b",
+          "destination": "resources/downloads/UI-Studio-FLUX-Runtime-windows-x64.zip.part02"
+        }
+      ],
+      "archive": {
+        "parts": [
+          "resources/downloads/UI-Studio-FLUX-Runtime-windows-x64.zip.part01",
+          "resources/downloads/UI-Studio-FLUX-Runtime-windows-x64.zip.part02"
+        ],
+        "bytes": 3004596619,
+        "sha256": "211e5a31b48e86cf2655cb3aa44f9860322e73b983f524b3cbff79cba521fea5",
+        "destination": "runtime/diffsynth"
+      },
+      "installer": {
+        "python": "3.10.9",
+        "pythonUrl": "https://www.python.org/ftp/python/3.10.9/python-3.10.9-embed-amd64.zip",
+        "sourceUrl": "https://github.com/modelscope/DiffSynth-Studio/archive/4dbf980d4d0eb34eda136300dd0d72014cff8965.zip",
+        "sourceRevision": "4dbf980d4d0eb34eda136300dd0d72014cff8965",
+        "dependencies": "Install the pinned DiffSynth project and its declared Python dependencies, including the CUDA build of PyTorch, into runtime/diffsynth."
+      }
+    },
+    {
+      "id": "flux-model",
+      "group": "FLUX.2 Klein 4B",
+      "name": "FLUX.2 Klein 4B model bundle",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "baseUrl": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/e7b7dc27f91deacad38e78976d1f2b499d76a294/",
+      "files": [
+        { "path": "text_encoder/config.json", "component": "flux-text-encoder", "bytes": 1536 },
+        { "path": "text_encoder/generation_config.json", "component": "flux-text-encoder", "bytes": 214 },
+        { "path": "text_encoder/model-00001-of-00002.safetensors", "component": "flux-text-encoder", "bytes": 4967215360, "sha256": "8c0506e7f4936fa7e26183a4fd8da4e2bdbc5990ba64ae441f965d51228f36ea" },
+        { "path": "text_encoder/model-00002-of-00002.safetensors", "component": "flux-text-encoder", "bytes": 3077766632, "sha256": "82f2bd839378541b0557bfabaf37c7d3d637071fdcb73302dedd7cf61162ce07" },
+        { "path": "text_encoder/model.safetensors.index.json", "component": "flux-text-encoder", "bytes": 32855 },
+        { "path": "tokenizer/added_tokens.json", "component": "flux-tokenizer", "bytes": 707 },
+        { "path": "tokenizer/chat_template.jinja", "component": "flux-tokenizer", "bytes": 4168 },
+        { "path": "tokenizer/merges.txt", "component": "flux-tokenizer", "bytes": 1671853 },
+        { "path": "tokenizer/special_tokens_map.json", "component": "flux-tokenizer", "bytes": 613 },
+        { "path": "tokenizer/tokenizer.json", "component": "flux-tokenizer", "bytes": 11422654, "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+        { "path": "tokenizer/tokenizer_config.json", "component": "flux-tokenizer", "bytes": 5404 },
+        { "path": "tokenizer/vocab.json", "component": "flux-tokenizer", "bytes": 2776833 },
+        { "path": "transformer/config.json", "component": "flux-transformer", "bytes": 541 },
+        { "path": "transformer/diffusion_pytorch_model.safetensors", "component": "flux-transformer", "bytes": 7751109744, "sha256": "9f29f9edcfdae452a653ffb51a534ca4decd389952c225724ff3b94042612a6e" },
+        { "path": "vae/config.json", "component": "flux-vae", "bytes": 821 },
+        { "path": "vae/diffusion_pytorch_model.safetensors", "component": "flux-vae", "bytes": 168120878, "sha256": "ca70d2202afe6415bdbcb8793ba8cd99fd159cfe6192381504d6c4d3036e0f04" }
+      ],
+      "destination": "models/FLUX.2-klein-4B"
+    },
+    {
+      "id": "dreamroom-lora",
+      "group": "FLUX LoRA",
+      "name": "DreamRoom Objects LoRA",
+      "license": "Private project asset",
+      "source": "https://github.com/rtx1001/UI-Studio/releases/tag/resources-v0.1.0",
+      "downloads": [{
+        "url": "https://github.com/rtx1001/UI-Studio/releases/download/resources-v0.1.0/DreamRoom-Objects-v1.safetensors",
+        "bytes": 120449264,
+        "sha256": "189f464fb9fc67d9ce9e708317a6bf90d923aebc7de2b82dcc925c1d21f69cac",
+        "destination": "models/lora/DreamRoom-Objects-v1.safetensors"
+      }]
+    }
+  ]
+}
