@@ -1,0 +1,22 @@
+name: Temporary update-notice release
+
+on:
+  push:
+    tags:
+      - v0.1.1
+
+permissions:
+  contents: write
+
+jobs:
+  publish-test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish temporary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "UI Studio v0.1.1 (Temporary Update Notice Test)" \
+            --notes "Temporary release used only to verify UI Studio's startup update notice. It contains no downloadable application assets and will be removed after testing."
