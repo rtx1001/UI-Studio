@@ -1,0 +1,20 @@
+name: Remove temporary update-notice release
+
+on:
+  push:
+    tags:
+      - cleanup-v0.1.1
+
+permissions:
+  contents: write
+
+jobs:
+  remove-test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary release and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete v0.1.1 --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/cleanup-v0.1.1"
