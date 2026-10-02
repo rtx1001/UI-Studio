@@ -85,6 +85,21 @@ struct DownloadProgress {
     phase: String,
 }
 
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    available: bool,
+    current_version: String,
+    latest_version: String,
+    release_url: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GpuInfo {
@@ -592,6 +607,74 @@ fn download_one(
     let maximum_attempts = 5u8;
     let mut initially_resumed = 0u64;
 
+    // A resource can contain several large files. If a later file or the
+    // install step fails, keep and reuse every earlier file that already
+    // passed validation instead of downloading the whole resource again.
+    if destination.is_file() {
+        let existing_bytes = fs::metadata(destination)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let _ = app.emit(
+            "resource-download-progress",
+            DownloadProgress {
+                resource_id: resource_id.to_string(),
+                file_name: file_name.clone(),
+                downloaded_bytes: existing_bytes,
+                total_bytes: expected_bytes,
+                resumed_bytes: existing_bytes,
+                attempt: 1,
+                phase: "verifying".to_string(),
+            },
+        );
+        match verified_download(destination, expected_bytes, expected_sha256) {
+            Ok(cached_bytes) => {
+                // A previous build could leave a duplicate `.part` beside an
+                // already completed file after a later install step failed.
+                // The verified final file is authoritative, so the duplicate
+                // partial is obsolete and must not confuse future retries.
+                if part.exists() {
+                    fs::remove_file(&part).map_err(|error| {
+                        format!(
+                            "Cannot remove obsolete partial download {}: {error}",
+                            part.display()
+                        )
+                    })?;
+                }
+                let _ = app.emit(
+                    "resource-download-progress",
+                    DownloadProgress {
+                        resource_id: resource_id.to_string(),
+                        file_name,
+                        downloaded_bytes: cached_bytes,
+                        total_bytes: expected_bytes,
+                        resumed_bytes: cached_bytes,
+                        attempt: 1,
+                        phase: "cached".to_string(),
+                    },
+                );
+                return Ok(cached_bytes);
+            }
+            Err(_) => {
+                let can_resume = expected_bytes.is_some_and(|expected| existing_bytes < expected);
+                let partial_bytes = fs::metadata(&part).map(|metadata| metadata.len()).unwrap_or(0);
+                if can_resume && existing_bytes > partial_bytes {
+                    if part.exists() {
+                        fs::remove_file(&part).map_err(|error| {
+                            format!("Cannot replace incomplete download {}: {error}", part.display())
+                        })?;
+                    }
+                    fs::rename(destination, &part).map_err(|error| {
+                        format!("Cannot preserve incomplete download {}: {error}", destination.display())
+                    })?;
+                } else {
+                    fs::remove_file(destination).map_err(|error| {
+                        format!("Cannot discard invalid download {}: {error}", destination.display())
+                    })?;
+                }
+            }
+        }
+    }
+
     for attempt in 1..=maximum_attempts {
         let mut offset = fs::metadata(&part).map(|metadata| metadata.len()).unwrap_or(0);
         if expected_bytes.is_none() && offset > 0 {
@@ -758,16 +841,13 @@ fn download_one(
                 phase: "verifying".to_string(),
             },
         );
-        if let Some(expected_sha256) = expected_sha256 {
-            let expected_size = expected_bytes.unwrap_or(actual_bytes);
-            if let Err(error) = verified_file(&part, expected_size, expected_sha256) {
-                let _ = fs::remove_file(&part);
-                if attempt < maximum_attempts {
-                    initially_resumed = 0;
-                    continue;
-                }
-                return Err(format!("{error}; the invalid partial file was discarded"));
+        if let Err(error) = verified_download(&part, expected_bytes, expected_sha256) {
+            let _ = fs::remove_file(&part);
+            if attempt < maximum_attempts {
+                initially_resumed = 0;
+                continue;
             }
+            return Err(format!("{error}; the invalid partial file was discarded"));
         }
         break;
     }
@@ -790,6 +870,27 @@ fn download_one(
         },
     );
     Ok(downloaded)
+}
+
+fn verified_download(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> Result<u64, String> {
+    let actual_bytes = fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?
+        .len();
+    if expected_bytes.is_some_and(|expected| actual_bytes != expected) {
+        return Err(format!(
+            "Size check failed for {}: expected {}, received {actual_bytes}",
+            path.display(),
+            expected_bytes.unwrap_or_default()
+        ));
+    }
+    if let Some(expected_sha256) = expected_sha256 {
+        verified_file(path, expected_bytes.unwrap_or(actual_bytes), expected_sha256)?;
+    }
+    Ok(actual_bytes)
 }
 
 fn validate_content_range(value: &str, expected_start: u64, expected_total: Option<u64>) -> Result<(), String> {
@@ -843,7 +944,47 @@ fn verified_file(path: &Path, expected_bytes: u64, expected_sha256: &str) -> Res
     Ok(())
 }
 
+fn validate_runtime_archive_entry(entry: &str) -> Result<(), String> {
+    let normalized = entry.trim().trim_start_matches("./");
+    if normalized.is_empty() {
+        return Ok(());
+    }
+    let relative = safe_resource_relative(normalized.trim_end_matches('/'))?;
+    let runtime_parent = PathBuf::from("runtime");
+    let runtime_destination = runtime_parent.join("diffsynth");
+    if relative != runtime_parent && !relative.starts_with(runtime_destination) {
+        return Err(format!("Runtime archive contains an unexpected path: {entry}"));
+    }
+    Ok(())
+}
+
 fn install_archive(
+    app: &AppHandle,
+    install_root: &Path,
+    resource_id: &str,
+    archive: &ManifestArchive,
+) -> Result<(), String> {
+    let status_path = install_root
+        .join("resources")
+        .join("last-resource-install.txt");
+    let result = install_archive_inner(app, install_root, resource_id, archive);
+    let status = match &result {
+        Ok(()) => format!(
+            "Resource: {resource_id}\nResult: installed\nInstall root: {}\nRuntime: {}\n",
+            install_root.display(),
+            install_root.join("runtime").join("diffsynth").display()
+        ),
+        Err(error) => format!(
+            "Resource: {resource_id}\nResult: failed\nInstall root: {}\nError: {error}\n",
+            install_root.display()
+        ),
+    };
+    let _ = fs::write(status_path, status);
+    result
+}
+
+fn install_archive_inner(
+    app: &AppHandle,
     install_root: &Path,
     resource_id: &str,
     archive: &ManifestArchive,
@@ -854,6 +995,18 @@ fn install_archive(
     }
     let download_root = install_root.join("resources").join("downloads");
     let joined = download_root.join(format!("{resource_id}.zip"));
+    let _ = app.emit(
+        "resource-download-progress",
+        DownloadProgress {
+            resource_id: resource_id.to_string(),
+            file_name: format!("{resource_id}.zip"),
+            downloaded_bytes: archive.bytes,
+            total_bytes: Some(archive.bytes),
+            resumed_bytes: 0,
+            attempt: 1,
+            phase: "installing".to_string(),
+        },
+    );
     let mut output = fs::File::create(&joined)
         .map_err(|error| format!("Cannot assemble {}: {error}", joined.display()))?;
     for part in &archive.parts {
@@ -879,14 +1032,7 @@ fn install_archive(
         return Err("The runtime archive could not be inspected".to_string());
     }
     for entry in String::from_utf8_lossy(&listing.stdout).lines() {
-        let normalized = entry.trim().trim_start_matches("./");
-        if normalized.is_empty() {
-            continue;
-        }
-        let relative = safe_resource_relative(normalized.trim_end_matches('/'))?;
-        if !relative.starts_with("runtime/diffsynth") {
-            return Err(format!("Runtime archive contains an unexpected path: {entry}"));
-        }
+        validate_runtime_archive_entry(entry)?;
     }
 
     let stage = install_root.join("resources").join("runtime-install-stage");
@@ -928,6 +1074,20 @@ fn install_archive(
             let _ = fs::rename(&backup, &final_runtime);
         }
         return Err(format!("Cannot install the FLUX runtime: {error}"));
+    }
+    if !final_runtime.join("python").join("python.exe").is_file()
+        || !final_runtime.join("diffsynth").is_dir()
+    {
+        if final_runtime.exists() {
+            let _ = fs::remove_dir_all(&final_runtime);
+        }
+        if backup.exists() {
+            let _ = fs::rename(&backup, &final_runtime);
+        }
+        return Err(format!(
+            "FLUX runtime files disappeared after installation at {}. Check antivirus quarantine and folder permissions; downloaded archive parts were preserved.",
+            final_runtime.display()
+        ));
     }
     if backup.exists() {
         fs::remove_dir_all(&backup)
@@ -978,7 +1138,7 @@ fn download_resource_blocking(app: &AppHandle, resource_id: &str) -> Result<Down
             downloaded_files += 1;
         }
         if let Some(archive) = &resource.archive {
-            install_archive(&install_root, resource_id, archive)?;
+            install_archive(app, &install_root, resource_id, archive)?;
         }
     }
 
@@ -1040,6 +1200,84 @@ fn hidden_command(program: &Path) -> Command {
         command.creation_flags(0x08000000);
     }
     command
+}
+
+fn version_parts(value: &str) -> Option<Vec<u64>> {
+    let core = value
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(['-', '+'])
+        .next()?;
+    let parts: Vec<u64> = core
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let (Some(mut latest), Some(mut current)) = (version_parts(latest), version_parts(current))
+    else {
+        return false;
+    };
+    let width = latest.len().max(current.len());
+    latest.resize(width, 0);
+    current.resize(width, 0);
+    latest > current
+}
+
+fn check_for_update_blocking() -> Result<UpdateCheck, String> {
+    const LATEST_RELEASE_API: &str =
+        "https://api.github.com/repos/rtx1001/UI-Studio/releases/latest";
+    const RELEASE_PREFIX: &str = "https://github.com/rtx1001/UI-Studio/releases/";
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("UI-Studio/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("Cannot initialize update check: {error}"))?;
+    let response_text = client
+        .get(LATEST_RELEASE_API)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| format!("Update check failed: {error}"))?
+        .text()
+        .map_err(|error| format!("Cannot read update response: {error}"))?;
+    let release: GithubRelease = serde_json::from_str(&response_text)
+        .map_err(|error| format!("Invalid update response: {error}"))?;
+    if !release.html_url.starts_with(RELEASE_PREFIX) {
+        return Err("GitHub returned an unexpected release URL".to_string());
+    }
+    let available = version_is_newer(&release.tag_name, &current);
+    Ok(UpdateCheck {
+        available,
+        current_version: current,
+        latest_version: release.tag_name.trim_start_matches(['v', 'V']).to_string(),
+        release_url: release.html_url,
+    })
+}
+
+#[tauri::command]
+async fn check_for_update() -> Result<UpdateCheck, String> {
+    tauri::async_runtime::spawn_blocking(check_for_update_blocking)
+        .await
+        .map_err(|error| format!("Update check task failed: {error}"))?
+}
+
+#[tauri::command]
+fn open_release_page(url: String) -> Result<(), String> {
+    const RELEASE_PREFIX: &str = "https://github.com/rtx1001/UI-Studio/releases/";
+    if !url.starts_with(RELEASE_PREFIX) {
+        return Err("Refusing to open an untrusted update URL".to_string());
+    }
+    hidden_command(Path::new("rundll32.exe"))
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .spawn()
+        .map_err(|error| format!("Could not open the release page: {error}"))?;
+    Ok(())
 }
 
 fn nvidia_smi_output(arguments: &[&str]) -> Option<std::process::Output> {
@@ -1523,6 +1761,8 @@ pub fn run() {
             settings_scope,
             probe_flux,
             scan_system,
+            check_for_update,
+            open_release_page,
             download_resource,
             run_flux_batch
         ])
@@ -1611,5 +1851,43 @@ mod tests {
         assert!(validate_content_range("bytes 0-99/100", 10, Some(100)).is_err());
         assert!(validate_content_range("bytes 1024-2047/8192", 1024, Some(4096)).is_err());
         assert!(validate_content_range("items 1-2/3", 1, Some(3)).is_err());
+    }
+
+    #[test]
+    fn permits_runtime_archive_parent_entries_only() {
+        assert!(validate_runtime_archive_entry("./").is_ok());
+        assert!(validate_runtime_archive_entry("./runtime/").is_ok());
+        assert!(validate_runtime_archive_entry("./runtime/diffsynth/").is_ok());
+        assert!(validate_runtime_archive_entry("./runtime/diffsynth/python/python.exe").is_ok());
+        assert!(validate_runtime_archive_entry("./runtime/other/file.txt").is_err());
+        assert!(validate_runtime_archive_entry("./outside/file.txt").is_err());
+        assert!(validate_runtime_archive_entry("../escape.txt").is_err());
+    }
+
+    #[test]
+    fn compares_release_versions() {
+        assert!(version_is_newer("v0.1.1", "0.1.0"));
+        assert!(version_is_newer("1.0.0", "0.9.9"));
+        assert!(version_is_newer("0.1.0.1", "0.1.0"));
+        assert!(!version_is_newer("v0.1.0", "0.1.0"));
+        assert!(!version_is_newer("0.1", "0.1.0"));
+        assert!(!version_is_newer("not-a-version", "0.1.0"));
+    }
+
+    #[test]
+    fn recognizes_completed_downloads_for_reuse() {
+        let base = sandbox();
+        fs::create_dir_all(&base).unwrap();
+        let completed = base.join("completed.bin");
+        fs::write(&completed, b"reusable download").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"reusable download"));
+
+        assert_eq!(
+            verified_download(&completed, Some(17), Some(&digest)).unwrap(),
+            17
+        );
+        assert!(verified_download(&completed, Some(18), Some(&digest)).is_err());
+        assert!(verified_download(&completed, Some(17), Some("invalid")).is_err());
+        fs::remove_dir_all(base).unwrap();
     }
 }

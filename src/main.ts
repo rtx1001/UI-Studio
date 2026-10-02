@@ -21,7 +21,7 @@ const help = (text: string) => `<span class="help-tip" tabindex="0" data-tooltip
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 <div class="app-shell">
-  <header class="topbar"><div class="brand"><img class="brand-mark" src="${logoUrl}" alt=""/><div><strong>UI Studio</strong><small>Batch asset reskin workspace</small></div></div><div class="path-actions"><button id="choose-source">${icon("folder")} Source folder</button><button id="choose-output">${icon("folder")} Output folder</button><button id="dry-run">${icon("report")} Scan input</button></div><button id="open-resources" class="resource-button" title="Model resources" aria-label="Open model resources">${icon("download")}</button><div id="model-badge" class="model-badge"><i></i><span>FLUX.2 Klein 4B</span><b id="model-status">checking runtime</b></div></header>
+  <header class="topbar"><div class="brand"><img class="brand-mark" src="${logoUrl}" alt=""/><div><strong>UI Studio</strong><small>Batch asset reskin workspace</small></div></div><div class="path-actions"><button id="choose-source">${icon("folder")} Source folder</button><button id="choose-output">${icon("folder")} Output folder</button><button id="dry-run">${icon("report")} Scan input</button></div><button id="update-notice" class="update-notice" type="button" hidden>Update available</button><button id="open-resources" class="resource-button" title="Model resources" aria-label="Open model resources">${icon("download")}</button><div id="model-badge" class="model-badge"><i></i><span>FLUX.2 Klein 4B</span><b id="model-status">checking runtime</b></div></header>
   <main id="workspace">
     <aside class="left-panel"><section><label>Source root</label><div id="source-path" class="path-field">Not selected</div></section><section><label>Output root</label><div id="output-path" class="path-field">Not selected</div></section><section class="folder-section"><div class="section-title"><strong>Folders</strong><span id="folder-count">0</span></div><div id="folder-tree" class="folder-tree"><p>Select a source folder.</p></div></section><section class="inventory-summary"><div><b id="total-count">0</b><span>images</span></div><div><b id="issue-count">0</b><span>issues</span></div><div><b id="collision-count">0</b><span>collisions</span></div></section></aside>
     <div id="left-resizer" class="panel-resizer" title="Drag to resize folders"></div>
@@ -61,12 +61,14 @@ let fluxAvailable: boolean | undefined;
 type RuntimeResource = { id: string; group: string; name: string; description: string; path: string; available: boolean; optional?: boolean; downloadBytes?: number; sizeEstimated?: boolean };
 type RuntimeProbe = { available: boolean; engine: string; missing: string[]; resources: RuntimeResource[] };
 type DownloadResult = { resourceId: string; files: number; bytes: number };
-type DownloadProgress = { resourceId: string; fileName: string; downloadedBytes: number; totalBytes?: number; resumedBytes: number; attempt: number; phase: "downloading" | "resuming" | "retrying" | "verifying" | "complete" };
+type DownloadProgress = { resourceId: string; fileName: string; downloadedBytes: number; totalBytes?: number; resumedBytes: number; attempt: number; phase: "downloading" | "resuming" | "retrying" | "verifying" | "cached" | "installing" | "complete" };
+type UpdateCheck = { available: boolean; currentVersion: string; latestVersion: string; releaseUrl: string };
 type GpuInfo = { name: string; memoryMib: number; driverVersion: string };
 type SystemScan = { compatible: boolean; nvidiaDetected: boolean; cudaAvailable: boolean; cudaVersion?: string; gpus: GpuInfo[]; cpuName: string; logicalCores: number; memoryBytes?: number; freeDiskBytes?: number; osName: string; warning?: string };
 let runtimeResources: RuntimeResource[] = [];
 let resourceDownloadActive = false;
 let activeDownloadPosition = "";
+let updateReleaseUrl = "";
 let systemScanActive = false, downloadHardwareApproved = false;
 let runtimeBlockingMessage = "";
 let paletteEditingIndex: number | null = null, pickerHue = 0, pickerSaturation = 0, pickerValue = 1;
@@ -86,10 +88,21 @@ await listen<DownloadProgress>("resource-download-progress", event => {
   meter.classList.toggle("indeterminate", !progress.totalBytes);
   fill.style.width = `${percent}%`;
   const amount = progress.totalBytes ? `${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${percent.toFixed(1)}%` : formatBytes(progress.downloadedBytes);
-  const action = progress.phase === "retrying" ? `Connection interrupted · retrying ${progress.attempt + 1}/5` : progress.phase === "verifying" ? "Verifying download" : progress.phase === "complete" ? "Download complete" : progress.resumedBytes > 0 ? `Resuming from ${formatBytes(progress.resumedBytes)}` : "Downloading";
+  const action = progress.phase === "retrying" ? `Connection interrupted · retrying ${progress.attempt + 1}/5` : progress.phase === "verifying" ? "Verifying download" : progress.phase === "cached" ? "Using verified downloaded file" : progress.phase === "installing" ? "Download complete · installing resource" : progress.phase === "complete" ? "File ready" : progress.resumedBytes > 0 ? `Resuming from ${formatBytes(progress.resumedBytes)}` : "Downloading";
   $("#resources-summary-text").textContent = `${action} · ${progress.fileName} · ${amount}${activeDownloadPosition}`;
 });
 function setStatus(value: string, progress: "idle" | "running" | "complete" | "failed" = "idle"): void { $("#status-text").textContent = runtimeBlockingMessage || value; $("#status-progress").className = `status-progress ${runtimeBlockingMessage ? "failed" : progress}`; }
+async function checkForUpdate(): Promise<void> {
+  try {
+    const update = await invoke<UpdateCheck>("check_for_update");
+    if (!update.available) return;
+    updateReleaseUrl = update.releaseUrl;
+    const notice = $<HTMLButtonElement>("#update-notice");
+    notice.textContent = `Update ${update.latestVersion}`;
+    notice.title = `Open UI Studio ${update.latestVersion} release page`;
+    notice.hidden = false;
+  } catch { /* Offline or rate-limited checks stay silent. */ }
+}
 function showTooltip(anchor: HTMLElement): void { const tooltip = $("#global-tooltip"); tooltip.textContent = anchor.dataset.tooltip ?? ""; tooltip.hidden = false; const rect = anchor.getBoundingClientRect(), tip = tooltip.getBoundingClientRect(), margin = 10; let left = rect.right - tip.width, top = rect.top - tip.height - 8; left = Math.max(margin, Math.min(window.innerWidth - tip.width - margin, left)); if (top < margin) top = Math.min(window.innerHeight - tip.height - margin, rect.bottom + 8); tooltip.style.left = `${Math.round(left)}px`; tooltip.style.top = `${Math.round(top)}px`; }
 function hideTooltip(): void { $("#global-tooltip").hidden = true; }
 function parentDir(value: string): string { const parts = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").split("/").filter(Boolean); parts.pop(); return parts.join("/"); }
@@ -257,6 +270,7 @@ $("#run-batch").onclick = async () => { persist(); const issue = runtimeIssue();
 $("#preview").onclick = event => { if ((event.target as HTMLElement).id === "preview" || (event.target as HTMLElement).classList.contains("preview-stage")) closePreview(); };
 $("#close-comparison").onclick = () => $("#comparison").hidden = true; $("#comparison").onclick = event => { if ((event.target as HTMLElement).id === "comparison") $("#comparison").hidden = true; };
 $("#open-resources").onclick = openResourcesModal;
+$("#update-notice").onclick = async () => { if (updateReleaseUrl) await invoke("open_release_page", { url: updateReleaseUrl }); };
 $("#close-preflight").onclick = () => $("#preflight-modal").hidden = true;
 $("#preflight-modal").onclick = event => { if ((event.target as HTMLElement).id === "preflight-modal") $("#preflight-modal").hidden = true; };
 $("#rescan-system").onclick = () => void scanHardware();
@@ -277,4 +291,5 @@ window.addEventListener("beforeunload", persist);
 $("#source-path").textContent = settings.sourceRoot || "Not selected"; $("#output-path").textContent = settings.outputRoot || "Not selected"; $<HTMLTextAreaElement>("#style-prompt").value = settings.stylePrompt; $<HTMLInputElement>("#lora-enabled").checked = settings.loraEnabled; $<HTMLInputElement>("#lora-strength").value = String(settings.loraStrength); $("#lora-strength-value").textContent = settings.loraStrength.toFixed(2); $<HTMLInputElement>("#overwrite").checked = settings.overwrite; $<HTMLSelectElement>("#group-by").value = settings.groupBy; $<HTMLInputElement>("#style-lock-enabled").checked = settings.styleLockEnabled; $<HTMLInputElement>("#style-seed").value = String(settings.styleSeed); $<HTMLSelectElement>("#working-resolution").value = String(settings.workingResolution); $<HTMLInputElement>("#minimum-resolution-enabled").checked = settings.minimumResolutionEnabled; $<HTMLInputElement>("#content-aware-scaling").checked = settings.contentAwareScaling; $<HTMLInputElement>("#denoise-strength").value = String(settings.fluxDenoisingStrength); $("#denoise-strength-value").textContent = settings.fluxDenoisingStrength.toFixed(2); $<HTMLInputElement>("#structure-preservation").value = String(settings.structurePreservation); $("#structure-preservation-value").textContent = settings.structurePreservation.toFixed(2); $<HTMLSelectElement>("#inference-steps").value = String(settings.inferenceSteps);
 const workspace = $("#workspace"); workspace.style.setProperty("--left-width", `${settings.leftPanelWidth}px`); workspace.style.setProperty("--right-width", `${settings.rightPanelWidth}px`); setupResizer("#left-resizer", "left"); setupResizer("#right-resizer", "right"); renderPalette(); updateResolutionNote(); updateRuntimeState(); renderStyleFingerprint(); if (settings.view === "list") { $("#list-view").classList.add("active"); $("#grid-view").classList.remove("active"); }
 refreshResources();
+void checkForUpdate();
 if (settings.sourceRoot) scanInput(); else renderAll();

@@ -727,6 +727,32 @@ body,
   color: #f6a14d;
 }
 
+.update-notice {
+  flex: 0 0 auto;
+  min-height: 30px;
+  margin-left: auto;
+  padding: 0 11px;
+  border-color: #c86f1d;
+  border-radius: 4px;
+  background: #3b3025;
+  color: #ffad55;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+
+.update-notice[hidden] { display: none; }
+
+.update-notice:hover {
+  border-color: #ffad55;
+  background: #513823;
+  color: #ffd0a0;
+}
+
+.update-notice:not([hidden]) + .resource-button {
+  margin-left: 0;
+}
+
 .resource-button:hover {
   border-color: #ffad55;
   background: #513823;
