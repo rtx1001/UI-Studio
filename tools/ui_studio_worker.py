@@ -26,8 +26,11 @@ FLUX_PYTHON = (FLUX_RUNTIME / "python" / "python.exe") if PORTABLE_ROOT else (FL
 
 
 def generation_layout(width: int, height: int, target: int = 1024, minimum_enabled: bool = True) -> tuple[tuple[int, int], tuple[int, int, int, int]]:
-    if target not in {256, 512, 768, 1024, 2048}:
-        raise ValueError("Working resolution must be 256, 512, 768, 1024, or 2048")
+    if target not in {0, 256, 512, 768, 1024, 2048}:
+        raise ValueError("Working resolution must be Auto, 256, 512, 768, 1024, or 2048")
+    if target == 0:
+        longest = max(1, width, height)
+        target = 256 if longest <= 256 else 512 if longest <= 512 else 768 if longest <= 768 else 1024 if longest <= 1024 else 2048
     # The selected tier is a minimum, never a downscale target. Large assets
     # retain their native working dimensions; only smaller assets are enlarged.
     scale = max(1.0, target / max(1, width, height)) if minimum_enabled else 1.0
@@ -220,10 +223,10 @@ def run_flux_batch(manifest_path: Path) -> dict[str, Any]:
     source_root = Path(job["sourceRoot"]).resolve()
     output_root = Path(job["outputRoot"]).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    working_resolution = int(job.get("workingResolution", 1024))
+    working_resolution = int(job.get("workingResolution", 0))
     minimum_resolution_enabled = bool(job.get("minimumResolutionEnabled", True))
-    if working_resolution not in {256, 512, 768, 1024, 2048}:
-        raise ValueError("Working resolution must be 256, 512, 768, 1024, or 2048")
+    if working_resolution not in {0, 256, 512, 768, 1024, 2048}:
+        raise ValueError("Working resolution must be Auto, 256, 512, 768, 1024, or 2048")
     content_aware_scaling = bool(job.get("contentAwareScaling", True))
     started = time.perf_counter()
     results: list[dict[str, Any]] = []
@@ -268,7 +271,7 @@ def run_flux_batch(manifest_path: Path) -> dict[str, Any]:
                 if source_box != (0, 0, source.width, source.height):
                     fit_note = f" | visible fit {source_box[2] - source_box[0]} x {source_box[3] - source_box[1]}"
                 lora_note = f" | LoRA {float(job.get('loraStrength', 1.0)):.2f}" if job.get("loraEnabled") else " | base model"
-                resolution_note = f"{working_resolution}px minimum" if minimum_resolution_enabled else "native resolution"
+                resolution_note = "automatic minimum" if minimum_resolution_enabled and working_resolution == 0 else f"{working_resolution}px minimum" if minimum_resolution_enabled else "native resolution"
                 results.append({"relativePath": relative, "status": "complete", "message": f"FLUX {resolution_note} on {size[0]} x {size[1]} canvas{fit_note}{lora_note} | {job.get('styleFingerprint', 'untracked style')}", "seconds": round(time.perf_counter() - item_started, 2), "index": index})
             except Exception as error:
                 results.append({"relativePath": relative, "status": "failed", "message": str(error), "index": index})

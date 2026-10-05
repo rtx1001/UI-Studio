@@ -2,6 +2,8 @@
 
 The initial portable package is a thin distribution containing the Windows application, its worker adapter, and the resource manifest. AI model weights and runtimes are intentionally not committed to Git or embedded in the ZIP.
 
+UI Studio can also run in Cloud API mode with an OpenAI API key. In that mode, the local AI runtime, model downloads, NVIDIA GPU, and CUDA compatibility check are not required. The API key is kept only in process memory for the current session and is not written to portable settings.
+
 ## Package layout
 
 ```text

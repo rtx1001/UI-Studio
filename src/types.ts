@@ -37,6 +37,7 @@ export type QueueStatus = "queued" | "processing" | "complete" | "failed" | "ski
 export type PaletteColor = { hex: string; weight: number };
 
 export type Settings = {
+  processingMode: "local" | "cloud";
   sourceRoot: string;
   outputRoot: string;
   stylePrompt: string;
@@ -51,7 +52,8 @@ export type Settings = {
   groupBy: "none" | "name" | "size" | "dimensions";
   styleLockEnabled: boolean;
   styleSeed: number;
-  workingResolution: 256 | 512 | 768 | 1024 | 2048;
+  workingResolution: 0 | 256 | 512 | 768 | 1024 | 2048;
+  resolutionSelectionVersion: 1;
   minimumResolutionEnabled: boolean;
   contentAwareScaling: boolean;
   leftPanelWidth: number;

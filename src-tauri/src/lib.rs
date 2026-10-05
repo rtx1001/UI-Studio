@@ -1,6 +1,8 @@
-use image::{GenericImageView, ImageReader};
+use base64::Engine;
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use reqwest::{
     header::{CONTENT_RANGE, RANGE},
+    blocking::multipart,
     StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -8,13 +10,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Mutex,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 #[derive(Deserialize)]
@@ -191,6 +194,49 @@ struct FluxBatchRequest {
     working_resolution: u32,
     minimum_resolution_enabled: bool,
     content_aware_scaling: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenAiBatchRequest {
+    source_root: String,
+    output_root: String,
+    relative_paths: Vec<String>,
+    style_prompt: String,
+    palette: String,
+    denoising_strength: f32,
+    structure_preservation: f32,
+    inference_steps: u32,
+    overwrite: bool,
+    style_fingerprint: String,
+    working_resolution: u32,
+    minimum_resolution_enabled: bool,
+    content_aware_scaling: bool,
+}
+
+#[derive(Default)]
+struct CloudApiState {
+    openai_key: Mutex<Option<String>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiImageResponse {
+    data: Vec<OpenAiImageData>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiImageData {
+    b64_json: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiError,
+}
+
+#[derive(Deserialize)]
+struct OpenAiError {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -1704,8 +1750,8 @@ fn run_backend_batch(
     if !matches!(request.inference_steps, 4 | 8 | 12) {
         return Err("Inference steps must be 4, 8, or 12".into());
     }
-    if !matches!(request.working_resolution, 256 | 512 | 768 | 1024 | 2048) {
-        return Err("FLUX working resolution must be 256, 512, 768, 1024, or 2048".into());
+    if !matches!(request.working_resolution, 0 | 256 | 512 | 768 | 1024 | 2048) {
+        return Err("FLUX working resolution must be Auto, 256, 512, 768, 1024, or 2048".into());
     }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1749,9 +1795,330 @@ async fn run_flux_batch(request: FluxBatchRequest) -> Result<Vec<ProcessResult>,
     .map_err(|e| format!("FLUX batch task failed: {e}"))?
 }
 
+#[tauri::command]
+fn set_openai_api_key(state: State<'_, CloudApiState>, api_key: String) -> Result<(), String> {
+    let key = api_key.trim();
+    if !key.starts_with("sk-") || key.len() < 20 || key.chars().any(char::is_whitespace) {
+        return Err("This does not look like a valid OpenAI API key.".to_string());
+    }
+    *state
+        .openai_key
+        .lock()
+        .map_err(|_| "Cloud credential storage is unavailable".to_string())? = Some(key.to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_openai_api_key(state: State<'_, CloudApiState>) -> Result<(), String> {
+    *state
+        .openai_key
+        .lock()
+        .map_err(|_| "Cloud credential storage is unavailable".to_string())? = None;
+    Ok(())
+}
+
+fn alpha_content_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (mut min_x, mut min_y) = (image.width(), image.height());
+    let (mut max_x, mut max_y) = (0, 0);
+    let mut found = false;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 0 {
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    found.then_some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+fn padded_content_bounds(image: &RgbaImage, enabled: bool) -> (u32, u32, u32, u32) {
+    if !enabled {
+        return (0, 0, image.width(), image.height());
+    }
+    let Some((x, y, width, height)) = alpha_content_bounds(image) else {
+        return (0, 0, image.width(), image.height());
+    };
+    let pad_x = ((width as f32 * 0.06).ceil() as u32).max(1);
+    let pad_y = ((height as f32 * 0.06).ceil() as u32).max(1);
+    let left = x.saturating_sub(pad_x);
+    let top = y.saturating_sub(pad_y);
+    let right = (x + width + pad_x).min(image.width());
+    let bottom = (y + height + pad_y).min(image.height());
+    (left, top, right - left, bottom - top)
+}
+
+fn round_16(value: f64) -> u32 {
+    (((value.max(16.0) / 16.0).ceil() as u32) * 16).max(16)
+}
+
+fn automatic_minimum(width: u32, height: u32) -> u32 {
+    match width.max(height) {
+        0..=256 => 256,
+        257..=512 => 512,
+        513..=768 => 768,
+        769..=1024 => 1024,
+        _ => 2048,
+    }
+}
+
+fn openai_canvas_size(width: u32, height: u32, minimum: Option<u32>) -> (u32, u32) {
+    let longest = width.max(height).max(1) as f64;
+    let requested_long = minimum.map(f64::from).unwrap_or(longest).max(longest).min(3072.0);
+    let initial_scale = requested_long / longest;
+    let mut canvas_w = round_16(width as f64 * initial_scale);
+    let mut canvas_h = round_16(height as f64 * initial_scale);
+    if canvas_w > canvas_h.saturating_mul(3) {
+        canvas_h = round_16(canvas_w as f64 / 3.0);
+    } else if canvas_h > canvas_w.saturating_mul(3) {
+        canvas_w = round_16(canvas_h as f64 / 3.0);
+    }
+    let pixels = u64::from(canvas_w) * u64::from(canvas_h);
+    if pixels < 655_360 {
+        let scale = (655_360.0 / pixels as f64).sqrt();
+        canvas_w = round_16(canvas_w as f64 * scale);
+        canvas_h = round_16(canvas_h as f64 * scale);
+    }
+    let pixels = u64::from(canvas_w) * u64::from(canvas_h);
+    let edge_scale = 3840.0 / f64::from(canvas_w.max(canvas_h));
+    let area_scale = (8_294_400.0 / pixels as f64).sqrt();
+    let scale = edge_scale.min(area_scale).min(1.0);
+    if scale < 1.0 {
+        canvas_w = ((canvas_w as f64 * scale / 16.0).floor() as u32 * 16).max(16);
+        canvas_h = ((canvas_h as f64 * scale / 16.0).floor() as u32 * 16).max(16);
+    }
+    (canvas_w, canvas_h)
+}
+
+fn openai_prompt(request: &OpenAiBatchRequest, source_has_alpha: bool) -> String {
+    let change = if request.denoising_strength >= 0.8 {
+        "Make a substantial visual redesign rather than a recolor. Replace surface styling, materials, ornament, edge treatment, and shading language while keeping the asset recognizable."
+    } else if request.denoising_strength >= 0.5 {
+        "Apply a clear stylistic redesign with visibly new materials, details, and rendering, not only palette changes."
+    } else {
+        "Apply a restrained restyle while retaining most original visual details."
+    };
+    let structure = if request.structure_preservation >= 0.75 {
+        "Preserve the silhouette, element placement, proportions, and readable UI function very closely."
+    } else if request.structure_preservation >= 0.4 {
+        "Preserve the overall silhouette and UI function, but allow secondary shapes and decorative details to change."
+    } else {
+        "Keep the same UI function and approximate footprint, but freely redesign internal shapes and details."
+    };
+    let alpha = if source_has_alpha {
+        "Keep the background transparent. Do not add a backdrop, frame, floor, shadow outside the existing visible asset, or opaque pixels in empty canvas areas."
+    } else {
+        "Keep the image fully opaque."
+    };
+    format!(
+        "Repaint the supplied UI game asset as a production-ready 2D interface asset. {change} {structure} Art direction: {}. Palette target with approximate dominance: {}. Maintain crisp readable edges and avoid adding text unless text already exists. {alpha} Batch style profile: {}.",
+        if request.style_prompt.trim().is_empty() { "cohesive polished game UI" } else { request.style_prompt.trim() },
+        request.palette,
+        request.style_fingerprint
+    )
+}
+
+fn openai_edit_image(
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+    request: &OpenAiBatchRequest,
+    source: &Path,
+    output: &Path,
+    source_info: &AssetInfo,
+) -> Result<(), String> {
+    let source_rgba = image::open(source)
+        .map_err(|error| format!("Cannot read source image: {error}"))?
+        .to_rgba8();
+    let bounds = padded_content_bounds(
+        &source_rgba,
+        request.content_aware_scaling && source_info.has_alpha,
+    );
+    let content = image::imageops::crop_imm(&source_rgba, bounds.0, bounds.1, bounds.2, bounds.3)
+        .to_image();
+    let minimum = request.minimum_resolution_enabled.then_some(if request.working_resolution == 0 {
+        automatic_minimum(content.width(), content.height())
+    } else {
+        request.working_resolution
+    });
+    let (canvas_w, canvas_h) = openai_canvas_size(content.width(), content.height(), minimum);
+    let scale = (canvas_w as f64 / content.width() as f64)
+        .min(canvas_h as f64 / content.height() as f64);
+    let placed_w = (content.width() as f64 * scale).round().max(1.0) as u32;
+    let placed_h = (content.height() as f64 * scale).round().max(1.0) as u32;
+    let placed = image::imageops::resize(&content, placed_w, placed_h, FilterType::Lanczos3);
+    let mut canvas = RgbaImage::new(canvas_w, canvas_h);
+    let offset_x = (canvas_w - placed_w) / 2;
+    let offset_y = (canvas_h - placed_h) / 2;
+    image::imageops::overlay(&mut canvas, &placed, i64::from(offset_x), i64::from(offset_y));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| format!("Cannot prepare cloud input: {error}"))?;
+    let quality = match request.inference_steps {
+        4 => "low",
+        8 => "medium",
+        _ => "high",
+    };
+    let image_part = multipart::Part::bytes(encoded.into_inner())
+        .file_name("ui-asset.png")
+        .mime_str("image/png")
+        .map_err(|error| format!("Cannot prepare cloud upload: {error}"))?;
+    let mut form = multipart::Form::new()
+        .text("model", "gpt-image-2.5-sunburst")
+        .part("image[]", image_part)
+        .text("prompt", openai_prompt(request, source_info.has_alpha))
+        .text("size", format!("{canvas_w}x{canvas_h}"))
+        .text("quality", quality)
+        .text("output_format", "png");
+    if source_info.has_alpha {
+        form = form.text("background", "transparent");
+    }
+    let response = client
+        .post("https://api.openai.com/v1/images/edits")
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("OpenAI request failed: {error}"))?;
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("Cannot read OpenAI response: {error}"))?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<OpenAiErrorEnvelope>(&body)
+            .map(|value| value.error.message)
+            .unwrap_or_else(|_| format!("HTTP {status}"));
+        return Err(if request_id.is_empty() { message } else { format!("{message} (request {request_id})") });
+    }
+    let response: OpenAiImageResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("Invalid OpenAI image response: {error}"))?;
+    let encoded = response.data.first().ok_or_else(|| "OpenAI returned no image".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&encoded.b64_json)
+        .map_err(|error| format!("Cannot decode OpenAI image: {error}"))?;
+    let generated = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Cannot read OpenAI image: {error}"))?
+        .to_rgba8();
+    let sx = generated.width() as f64 / canvas_w as f64;
+    let sy = generated.height() as f64 / canvas_h as f64;
+    let crop_x = (offset_x as f64 * sx).round() as u32;
+    let crop_y = (offset_y as f64 * sy).round() as u32;
+    let crop_w = ((placed_w as f64 * sx).round() as u32).min(generated.width().saturating_sub(crop_x)).max(1);
+    let crop_h = ((placed_h as f64 * sy).round() as u32).min(generated.height().saturating_sub(crop_y)).max(1);
+    let crop = image::imageops::crop_imm(&generated, crop_x, crop_y, crop_w, crop_h).to_image();
+    let restored = image::imageops::resize(&crop, bounds.2, bounds.3, FilterType::Lanczos3);
+    let mut final_image = if source_info.has_alpha {
+        RgbaImage::new(source_info.width, source_info.height)
+    } else {
+        RgbaImage::from_pixel(source_info.width, source_info.height, image::Rgba([0, 0, 0, 255]))
+    };
+    image::imageops::overlay(&mut final_image, &restored, i64::from(bounds.0), i64::from(bounds.1));
+    if source_info.has_alpha {
+        for (pixel, source_pixel) in final_image.pixels_mut().zip(source_rgba.pixels()) {
+            pixel[3] = source_pixel[3];
+        }
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("Cannot create output folder: {error}"))?;
+    }
+    let format = if source_info.extension == "png" { ImageFormat::Png } else { ImageFormat::Jpeg };
+    let result_image = if format == ImageFormat::Jpeg {
+        DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(final_image).to_rgb8())
+    } else {
+        DynamicImage::ImageRgba8(final_image)
+    };
+    result_image
+        .save_with_format(output, format)
+        .map_err(|error| format!("Cannot save cloud output: {error}"))
+}
+
+fn run_openai_batch_blocking(
+    app: &AppHandle,
+    request: OpenAiBatchRequest,
+    api_key: String,
+) -> Result<Vec<ProcessResult>, String> {
+    let source_root = fs::canonicalize(&request.source_root)
+        .map_err(|error| format!("Cannot open source folder: {error}"))?;
+    fs::create_dir_all(&request.output_root)
+        .map_err(|error| format!("Cannot create output folder: {error}"))?;
+    let output_root = fs::canonicalize(&request.output_root)
+        .map_err(|error| format!("Cannot open output folder: {error}"))?;
+    if source_root == output_root || output_root.starts_with(&source_root) {
+        return Err("Output folder must be separate from and outside the source folder".into());
+    }
+    if !(0.0..=1.0).contains(&request.denoising_strength)
+        || !(0.0..=1.0).contains(&request.structure_preservation)
+        || !matches!(request.inference_steps, 4 | 8 | 12)
+        || !matches!(request.working_resolution, 0 | 256 | 512 | 768 | 1024 | 2048)
+    {
+        return Err("Cloud processing settings are invalid".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("UI-Studio/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|error| format!("Cannot initialize OpenAI client: {error}"))?;
+    let total = request.relative_paths.len();
+    let mut results = Vec::with_capacity(total);
+    for (index, relative_string) in request.relative_paths.iter().enumerate() {
+        let relative = match safe_relative(relative_string) {
+            Ok(value) => value,
+            Err(message) => {
+                results.push(ProcessResult { relative_path: relative_string.clone(), output_path: String::new(), status: "failed".into(), valid: false, message, source_width: 0, source_height: 0, output_width: None, output_height: None, alpha_preserved: false });
+                continue;
+            }
+        };
+        let source = source_root.join(&relative);
+        let output = output_root.join(&relative);
+        let source_info = match inspect(&source, &source_root) {
+            Ok(value) => value,
+            Err(message) => {
+                results.push(ProcessResult { relative_path: relative_string.clone(), output_path: output.to_string_lossy().to_string(), status: "failed".into(), valid: false, message, source_width: 0, source_height: 0, output_width: None, output_height: None, alpha_preserved: false });
+                continue;
+            }
+        };
+        let _ = app.emit("cloud-batch-progress", serde_json::json!({"relativePath": relative_string, "current": index + 1, "total": total}));
+        if output.exists() && !request.overwrite {
+            results.push(ProcessResult { relative_path: relative_string.clone(), output_path: output.to_string_lossy().to_string(), status: "skipped".into(), valid: false, message: "Output already exists; overwrite is disabled".into(), source_width: source_info.width, source_height: source_info.height, output_width: None, output_height: None, alpha_preserved: false });
+            continue;
+        }
+        let item = match openai_edit_image(&client, &api_key, &request, &source, &output, &source_info) {
+            Ok(()) => WorkerItem { relative_path: relative_string.clone(), status: "complete".into(), message: "OpenAI cloud repaint complete".into() },
+            Err(message) => WorkerItem { relative_path: relative_string.clone(), status: "failed".into(), message },
+        };
+        results.push(validated_worker_result(&source_root, &output_root, item));
+    }
+    Ok(results)
+}
+
+#[tauri::command]
+async fn run_openai_batch(
+    app: AppHandle,
+    state: State<'_, CloudApiState>,
+    request: OpenAiBatchRequest,
+) -> Result<Vec<ProcessResult>, String> {
+    let api_key = state
+        .openai_key
+        .lock()
+        .map_err(|_| "Cloud credential storage is unavailable".to_string())?
+        .clone()
+        .ok_or_else(|| "OpenAI API key is not set for this session".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || run_openai_batch_blocking(&app, request, api_key))
+        .await
+        .map_err(|error| format!("OpenAI batch task failed: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(CloudApiState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             inventory_folder,
@@ -1764,7 +2131,10 @@ pub fn run() {
             check_for_update,
             open_release_page,
             download_resource,
-            run_flux_batch
+            run_flux_batch,
+            set_openai_api_key,
+            clear_openai_api_key,
+            run_openai_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running UI Studio");
@@ -1889,5 +2259,34 @@ mod tests {
         assert!(verified_download(&completed, Some(18), Some(&digest)).is_err());
         assert!(verified_download(&completed, Some(17), Some("invalid")).is_err());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn openai_canvases_follow_custom_size_limits() {
+        for (width, height, minimum) in [
+            (32, 32, Some(256)),
+            (278, 61, Some(512)),
+            (1024, 1024, None),
+            (8000, 1200, None),
+            (1200, 8000, Some(2048)),
+        ] {
+            let (canvas_width, canvas_height) = openai_canvas_size(width, height, minimum);
+            let pixels = u64::from(canvas_width) * u64::from(canvas_height);
+            assert_eq!(canvas_width % 16, 0);
+            assert_eq!(canvas_height % 16, 0);
+            assert!(canvas_width <= 3840 && canvas_height <= 3840);
+            assert!(canvas_width <= canvas_height * 3 && canvas_height <= canvas_width * 3);
+            assert!((655_360..=8_294_400).contains(&pixels));
+        }
+    }
+
+    #[test]
+    fn automatic_minimum_matches_dimension_groups() {
+        assert_eq!(automatic_minimum(64, 256), 256);
+        assert_eq!(automatic_minimum(257, 20), 512);
+        assert_eq!(automatic_minimum(513, 512), 768);
+        assert_eq!(automatic_minimum(1024, 80), 1024);
+        assert_eq!(automatic_minimum(1025, 20), 2048);
+        assert_eq!(automatic_minimum(4096, 4096), 2048);
     }
 }

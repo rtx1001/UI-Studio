@@ -6,7 +6,14 @@
 
 A portable Windows tool for batch-reskinning UI image assets with a consistent visual style.
 
-It provides folder-based input and output browsing, style and palette controls, batch processing, and preservation of source filenames, folder structure, image dimensions, and transparency.
+It provides folder-based input and output browsing, style and palette controls, batch processing, and preservation of source filenames, folder structure, image dimensions, and transparency. Processing can run locally or through an optional cloud API mode.
+
+## Processing modes
+
+- **Local:** Runs the bundled FLUX workflow on a compatible NVIDIA GPU after the required resources are downloaded.
+- **Cloud API:** Uses an OpenAI API key held only for the current app session. Local model downloads and CUDA are not required in this mode.
+
+The automatic working-size option selects a suitable canvas tier for each source image. Fixed minimum tiers remain available for manually controlled batches.
 
 ## Screenshots
 
